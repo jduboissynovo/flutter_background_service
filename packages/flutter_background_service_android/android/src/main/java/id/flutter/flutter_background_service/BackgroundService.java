@@ -47,6 +47,9 @@ public class BackgroundService extends Service implements MethodChannel.MethodCa
     private Config config;
     private DartExecutor.DartEntrypoint dartEntrypoint;
     private boolean isManuallyStopped = false;
+    // True once this instance acquired the static wake lock in runService().
+    // The lock is reference counted, so every acquire needs one release.
+    private boolean wakeLockHeld = false;
     private String notificationTitle;
     private String notificationContent;
     private String notificationChannelId;
@@ -112,6 +115,14 @@ public class BackgroundService extends Service implements MethodChannel.MethodCa
         stopForeground(true);
         isRunning.set(false);
 
+        if (wakeLockHeld) {
+            wakeLockHeld = false;
+            WakeLock lock = lockStatic;
+            if (lock != null && lock.isHeld()) {
+                lock.release();
+            }
+        }
+
         if (backgroundEngine != null) {
             backgroundEngine.getServiceControlSurface().detachFromService();
             backgroundEngine.destroy();
@@ -173,17 +184,37 @@ public class BackgroundService extends Service implements MethodChannel.MethodCa
                 ServiceCompat.startForeground(this, notificationId, mBuilder.build(), serviceType);
             } catch (SecurityException e) {
               Log.w(TAG, "Failed to start foreground service due to SecurityException - have you forgotten to request a permission? - " + e.getMessage());
+            } catch (IllegalStateException e) {
+                // e.g. ForegroundServiceStartNotAllowedException (a background start, or the
+                // dataSync time limit already exhausted). Without stopping here the service
+                // keeps running as a non-foreground service and the system kills the app
+                // with ForegroundServiceDidNotStartInTimeException.
+                Log.w(TAG, "Failed to start foreground service, stopping: " + e.getMessage());
+                stopManually();
             }
         }
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        if (isManuallyStopped) {
+            return START_NOT_STICKY;
+        }
         config.setManuallyStopped(false);
         WatchdogReceiver.enqueue(this);
         runService();
 
         return START_NOT_STICKY;
+    }
+
+    /**
+     * Stops the service without the watchdog bringing it back. Same effect as the
+     * "stopService" method call from Dart.
+     */
+    private void stopManually() {
+        isManuallyStopped = true;
+        WatchdogReceiver.remove(this);
+        stopSelf();
     }
 
     @SuppressLint("WakelockTimeout")
@@ -196,8 +227,12 @@ public class BackgroundService extends Service implements MethodChannel.MethodCa
 
             Log.v(TAG, "Starting flutter engine for background service");
             getLock(getApplicationContext()).acquire();
+            wakeLockHeld = true;
 
             updateNotificationInfo();
+            if (isManuallyStopped) {
+                return;
+            }
 
             FlutterLoader flutterLoader = FlutterInjector.instance().flutterLoader();
             // initialize flutter if it's not initialized yet
@@ -253,6 +288,29 @@ public class BackgroundService extends Service implements MethodChannel.MethodCa
         if (isRunning.get()) {
             WatchdogReceiver.enqueue(getApplicationContext(), 1000);
         }
+    }
+
+    /**
+     * Android 15+ calls this when a dataSync foreground service has run for its 6 hour
+     * limit (per 24h while the app is in the background). The service has a few seconds
+     * to stop, otherwise the system throws ForegroundServiceDidNotStopInTimeException.
+     * Must go through the manual stop path so the watchdog does not restart it (that
+     * start would be rejected while the limit is exhausted).
+     */
+    @Override
+    public void onTimeout(int startId, int fgsType) {
+        Log.w(TAG, "Foreground service timeout (fgsType=" + fgsType + "), stopping service");
+        try {
+            JSONObject args = new JSONObject();
+            args.put("fgsType", fgsType);
+            JSONObject message = new JSONObject();
+            message.put("method", "fgsTimeout");
+            message.put("args", args);
+            FlutterBackgroundServicePlugin.mainPipe.invoke(message);
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to report foreground service timeout: " + e.getMessage());
+        }
+        stopManually();
     }
 
     @Override

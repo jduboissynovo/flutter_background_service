@@ -22,7 +22,8 @@ rootProject.allprojects {
 apply plugin: 'com.android.library'
 
 android {
-    compileSdkVersion 34
+    // 35+ is required for Service.onTimeout(int, int) (see BackgroundService).
+    compileSdkVersion 36
 
     namespace = "id.flutter.flutter_background_service"
     
